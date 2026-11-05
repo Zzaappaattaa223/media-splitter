@@ -1,4 +1,26 @@
-import { MediaMetadata, SegmentInfo, JobProgress } from '../types';
+import {
+  Input,
+  Output,
+  Conversion,
+  BlobSource,
+  BufferTarget,
+  Mp4InputFormat,
+  QuickTimeInputFormat,
+  WebMInputFormat,
+  Mp3InputFormat,
+  WaveInputFormat,
+  OggInputFormat,
+  AdtsInputFormat,
+  FlacInputFormat,
+  Mp4OutputFormat,
+  WebMOutputFormat,
+  Mp3OutputFormat,
+  WavOutputFormat,
+  OggOutputFormat,
+  MovOutputFormat,
+  OutputFormat
+} from 'mediabunny';
+import { MediaMetadata, SegmentInfo, JobProgress, CutPrecision } from '../types';
 
 export interface SliceCallbacks {
   onProgress: (progress: Partial<JobProgress>) => void;
@@ -10,11 +32,11 @@ export async function executeSplitJob(
   file: File,
   metadata: MediaMetadata,
   segments: SegmentInfo[],
+  precision: CutPrecision,
   callbacks: SliceCallbacks
 ): Promise<void> {
   const startTimeMs = performance.now();
   let totalBytesProcessed = 0;
-  const totalFileBytes = file.size;
 
   for (let i = 0; i < segments.length; i++) {
     if (callbacks.isCancelled()) {
@@ -31,13 +53,25 @@ export async function executeSplitJob(
 
     let segmentBlob: Blob;
 
-    if (metadata.format === 'wav') {
-      segmentBlob = await sliceWavSegment(file, metadata, seg);
-    } else if (metadata.format === 'mp3') {
-      segmentBlob = await sliceMp3Segment(file, metadata, seg);
-    } else {
-      // General video/audio stream slice
-      segmentBlob = await sliceGenericSegment(file, metadata, seg);
+    try {
+      // Primary engine: Mediabunny native container remuxer & trimmer
+      // Produces standard ISO BMFF / WebM / MP3 / WAV with valid headers and sample indices
+      segmentBlob = await sliceWithMediabunny(file, metadata, seg, precision);
+    } catch (primaryErr) {
+      console.warn(`Mediabunny trimming failed for ${seg.filename}, trying fallback:`, primaryErr);
+
+      if (metadata.format === 'wav') {
+        segmentBlob = await sliceWavFallback(file, metadata, seg);
+      } else if (metadata.format === 'mp3') {
+        segmentBlob = await sliceMp3Fallback(file, metadata, seg);
+      } else {
+        // Re-throw if video cannot be multiplexed
+        throw new Error(
+          `No se pudo generar un contenedor de video reproducible para ${seg.filename}: ${
+            primaryErr instanceof Error ? primaryErr.message : String(primaryErr)
+          }`
+        );
+      }
     }
 
     seg.actualBytes = segmentBlob.size;
@@ -51,10 +85,11 @@ export async function executeSplitJob(
     const avgSecPerSeg = elapsedSec / (i + 1);
     const etaSeconds = Math.round(remainingSegments * avgSecPerSeg);
 
-    // Approximate JS heap if supported in Chrome
-    let memoryHeapMB = 35; // safe typical baseline
+    let memoryHeapMB = 35;
     if ('memory' in performance && (performance as unknown as { memory: { usedJSHeapSize: number } }).memory) {
-      memoryHeapMB = Math.round((performance as unknown as { memory: { usedJSHeapSize: number } }).memory.usedJSHeapSize / (1024 * 1024));
+      memoryHeapMB = Math.round(
+        (performance as unknown as { memory: { usedJSHeapSize: number } }).memory.usedJSHeapSize / (1024 * 1024)
+      );
     }
 
     callbacks.onProgress({
@@ -66,19 +101,105 @@ export async function executeSplitJob(
       memoryHeapMB
     });
 
-    // Stream-save or deliver segment immediately
+    // Write directly to disk or buffer list
     await callbacks.onSegmentComplete(seg, segmentBlob);
 
-    // Small yield to allow UI update & garbage collection
-    await new Promise((resolve) => setTimeout(resolve, 15));
+    // Yield control for browser UI updates and Garbage Collection
+    await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
 
 /**
- * Slices a WAV audio file accurately by modifying the 44-byte RIFF header
- * and slicing PCM bytes in O(1) memory.
+ * Robust, fully compliant container multiplexing via Mediabunny.
+ * Writes proper ISO BMFF (ftyp, moov with fastStart), EBML clusters, or audio frames.
  */
-async function sliceWavSegment(file: File, metadata: MediaMetadata, seg: SegmentInfo): Promise<Blob> {
+async function sliceWithMediabunny(
+  file: File,
+  metadata: MediaMetadata,
+  seg: SegmentInfo,
+  precision: CutPrecision
+): Promise<Blob> {
+  const inputFormats = [
+    new Mp4InputFormat(),
+    new QuickTimeInputFormat(),
+    new WebMInputFormat(),
+    new Mp3InputFormat(),
+    new WaveInputFormat(),
+    new OggInputFormat(),
+    new AdtsInputFormat(),
+    new FlacInputFormat()
+  ];
+
+  let outputFormat: OutputFormat;
+  let mimeType = metadata.rawMimeType;
+
+  switch (metadata.format) {
+    case 'mp4':
+      outputFormat = new Mp4OutputFormat({ fastStart: 'in-memory' });
+      mimeType = 'video/mp4';
+      break;
+    case 'mov':
+      outputFormat = new MovOutputFormat();
+      mimeType = 'video/quicktime';
+      break;
+    case 'webm':
+      outputFormat = new WebMOutputFormat();
+      mimeType = 'video/webm';
+      break;
+    case 'mp3':
+      outputFormat = new Mp3OutputFormat();
+      mimeType = 'audio/mpeg';
+      break;
+    case 'wav':
+      outputFormat = new WavOutputFormat();
+      mimeType = 'audio/wav';
+      break;
+    case 'ogg':
+      outputFormat = new OggOutputFormat();
+      mimeType = 'audio/ogg';
+      break;
+    default:
+      if (metadata.hasVideo) {
+        outputFormat = new Mp4OutputFormat({ fastStart: 'in-memory' });
+        mimeType = 'video/mp4';
+      } else {
+        outputFormat = new Mp3OutputFormat();
+        mimeType = 'audio/mpeg';
+      }
+  }
+
+  const target = new BufferTarget();
+  const output = new Output({ format: outputFormat, target });
+  const input = new Input({
+    source: new BlobSource(file),
+    formats: inputFormats
+  });
+
+  const conversion = await Conversion.init({
+    input,
+    output,
+    trim: {
+      start: seg.startTime,
+      end: seg.endTime
+    },
+    // In Fast mode, use lossless stream copy whenever possible
+    copy: precision === 'fast' ? {} : false,
+    showWarnings: false
+  });
+
+  await conversion.execute();
+
+  if (!target.buffer) {
+    throw new Error(`BufferTarget vacío para el segmento ${seg.filename}`);
+  }
+
+  return new Blob([target.buffer], { type: mimeType });
+}
+
+/**
+ * Fallback bit-accurate WAV audio slicer
+ */
+async function sliceWavFallback(file: File, metadata: MediaMetadata, seg: SegmentInfo): Promise<Blob> {
   const headerBuf = await file.slice(0, 44).arrayBuffer();
   const view = new DataView(headerBuf);
 
@@ -89,17 +210,17 @@ async function sliceWavSegment(file: File, metadata: MediaMetadata, seg: Segment
   const byteRate = sampleRate * blockAlign;
 
   const dataStartByte = 44;
-  const startByteOffset = Math.floor(seg.startTime * byteRate / blockAlign) * blockAlign;
-  const endByteOffset = Math.min(file.size - dataStartByte, Math.floor(seg.endTime * byteRate / blockAlign) * blockAlign);
+  const startByteOffset = Math.floor((seg.startTime * byteRate) / blockAlign) * blockAlign;
+  const endByteOffset = Math.min(
+    file.size - dataStartByte,
+    Math.floor((seg.endTime * byteRate) / blockAlign) * blockAlign
+  );
   const chunkLength = Math.max(0, endByteOffset - startByteOffset);
 
-  // Clone header and update RIFF & data size fields
   const newHeader = new Uint8Array(headerBuf.slice(0, 44));
   const newView = new DataView(newHeader.buffer);
 
-  // Total file size - 8
   newView.setUint32(4, 36 + chunkLength, true);
-  // data chunk size
   newView.setUint32(40, chunkLength, true);
 
   const pcmBlob = file.slice(dataStartByte + startByteOffset, dataStartByte + endByteOffset);
@@ -107,9 +228,9 @@ async function sliceWavSegment(file: File, metadata: MediaMetadata, seg: Segment
 }
 
 /**
- * Slices an MP3 audio file at aligned frame boundaries with optional ID3v2 header.
+ * Fallback frame-aligned MP3 slicer
  */
-async function sliceMp3Segment(file: File, metadata: MediaMetadata, seg: SegmentInfo): Promise<Blob> {
+async function sliceMp3Fallback(file: File, metadata: MediaMetadata, seg: SegmentInfo): Promise<Blob> {
   const totalDuration = metadata.duration || 1;
   const totalSize = file.size;
 
@@ -119,7 +240,6 @@ async function sliceMp3Segment(file: File, metadata: MediaMetadata, seg: Segment
   const rawStart = Math.floor(startFrac * totalSize);
   const rawEnd = Math.min(totalSize, Math.floor(endFrac * totalSize));
 
-  // Align start to the next MPEG sync word (0xFFE...)
   const alignProbeSize = Math.min(4096, totalSize - rawStart);
   let alignedStart = rawStart;
 
@@ -136,21 +256,4 @@ async function sliceMp3Segment(file: File, metadata: MediaMetadata, seg: Segment
 
   const chunkBlob = file.slice(alignedStart, rawEnd);
   return new Blob([chunkBlob], { type: 'audio/mpeg' });
-}
-
-/**
- * Generic slicing for video (MP4/WebM) and other audio formats via streaming byte-range slices.
- */
-async function sliceGenericSegment(file: File, metadata: MediaMetadata, seg: SegmentInfo): Promise<Blob> {
-  const totalDuration = metadata.duration || 1;
-  const totalSize = file.size;
-
-  const startFrac = seg.startTime / totalDuration;
-  const endFrac = seg.endTime / totalDuration;
-
-  const startByte = Math.floor(startFrac * totalSize);
-  const endByte = Math.min(totalSize, Math.floor(endFrac * totalSize));
-
-  const chunkBlob = file.slice(startByte, endByte);
-  return new Blob([chunkBlob], { type: metadata.rawMimeType });
 }

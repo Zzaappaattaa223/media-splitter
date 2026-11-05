@@ -4,7 +4,7 @@ import { MediaMetadata, SplitConfig, SegmentPlan, JobProgress, SegmentInfo } fro
 import { inspectMediaFile } from './lib/engine/inspector';
 import { createSegmentPlan } from './lib/engine/planner';
 import { executeSplitJob } from './lib/engine/slicer';
-import { pickOutputDirectory, writeSegmentToDirectory } from './lib/engine/writer';
+import { pickOutputDirectory, writeSegmentToDirectory, purgePreviousFileParts } from './lib/engine/writer';
 import { Dropzone } from './components/Dropzone';
 import { SplitControls } from './components/SplitControls';
 import { ProgressDashboard } from './components/ProgressDashboard';
@@ -119,6 +119,15 @@ export const App: React.FC = () => {
     setCompletedSegments([]);
     const segmentsQueue = [...plan.segments];
 
+    // Purge any prior failed or partial generation files for this media file
+    if (targetDirHandle) {
+      try {
+        await purgePreviousFileParts(targetDirHandle, selectedFile.name);
+      } catch (purgeErr) {
+        console.warn('Error purgando partes previas:', purgeErr);
+      }
+    }
+
     setProgress({
       status: 'processing',
       currentSegmentIndex: 1,
@@ -134,7 +143,7 @@ export const App: React.FC = () => {
     });
 
     try {
-      await executeSplitJob(selectedFile, metadata, segmentsQueue, {
+      await executeSplitJob(selectedFile, metadata, segmentsQueue, config.precision, {
         onProgress: (p) => {
           setProgress(prev => ({ ...prev, ...p }));
         },

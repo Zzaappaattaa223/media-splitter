@@ -116,19 +116,25 @@ flowchart TD
   2. **Por Tamaño ($S_{\text{max}}$):** Con base en el bitrate promedio $B$, estima la duración $T \approx S_{\text{max}} / B$. Aplica un margen de seguridad de -5% para garantizar que fluctuaciones de bitrate variable (VBR) no excedan el tamaño solicitado por el usuario. En modo *Corte Rápido*, se alinea al keyframe adyacente dentro del margen de tolerancia.
   3. **Por Número de Partes ($N$):** $T = D / N$, aplicando el mismo ajuste a keyframes en modo rápido.
 
-#### C. `StreamSplitterWorker` (Motor de Segmentación en Web Worker)
-- **Objetivo:** Ejecutar la extracción y re-empaquetado sin bloquear la interfaz gráfica.
-- **Estrategia de Memoria Constante:**
-  - El worker no almacena en memoria los segmentos completos. Opera mediante un pipeline de flujo (`ReadableStream` / `TransformStream`).
-  - Para cada segmento planificado:
-    1. Genera la cabecera reconstruida del contenedor (ej. un nuevo `moov` para MP4 adaptando la duración, las pistas y corrigiendo los offsets en `stco`/`co64`).
-    2. Lee los datos multimedia del rango correspondiente usando `file.slice(startOffset, endOffset)` en bloques de 2 MB a 4 MB.
-    3. Emite los fragmentos directamente hacia el escritor de disco.
-    4. El garbage collector del motor JS libera el bloque anterior inmediatamente, manteniendo la memoria total ocupada por debajo de 50 MB en todo momento.
+#### C. `StreamSplitterWorker` & `ContainerMuxer` (Generación de Archivos 100% Reproducibles)
+- **Objetivo:** Garantizar que cada segmento generado sea un archivo contenedor válido (`.mp4`, `.webm`, `.mp3`, `.wav`, etc.) con cabeceras íntegras (`ftyp`, `moov`, `stbl` con `fastStart: true`, cabeceras EBML o RIFF) reproducible de inmediato en cualquier reproductor o navegador.
+- **Motor de Remuxing / Trimming (Mediabunny Toolkit):**
+  - Se sustituye el corte plano de bytes por el motor de multiplexación y demuxing nativo en TypeScript (`mediabunny`).
+  - Para cada segmento:
+    1. Se crea un `Input` alimentado por un `BlobSource(file)` y formatos reconocidos (`IsobmffInputFormat`, `MatroskaInputFormat`, `Mp3InputFormat`, `WaveInputFormat`, etc.). `BlobSource` lee únicamente los rangos de bytes requeridos bajo demanda, preservando el límite de memoria constante.
+    2. Se inicializa una `Conversion` con recorte por timestamps: `trim: { start: seg.startTime, end: seg.endTime }`.
+    3. En modo *Corte Rápido*, se habilita `copy: {}` para realizar copias de flujo (`stream copy`) de paquetes directas sin recodificación innecesaria.
+    4. Se genera el contenedor destino (`Mp4OutputFormat({ fastStart: true })`, `WebMOutputFormat()`, `Mp3OutputFormat()`, `WavOutputFormat()`), garantizando que la tabla de índices de fotogramas y muestras sea válida.
+    5. El resultado se vierte a un `BufferTarget` que se libera de inmediato tras la escritura en disco.
 
-#### D. `DiskWriter` (Guardado de Archivos Eficiente)
-- **Modo Preferente:** `window.showDirectoryPicker()`. El usuario selecciona una carpeta de destino una sola vez. Cada segmento se escribe mediante un `FileSystemWritableFileStream` a medida que se generan los bytes.
-- **Modo Fallback:** Si la API del sistema de archivos no está soportada (ej. Firefox o Safari en ciertas versiones), se utiliza un empaquetador ZIP en streaming (`client-zip`) que descarga un único archivo comprimido sin comprimir de nuevo los datos (método Store), emitiendo el stream directamente al navegador.
+#### D. `DiskWriter` & Política de Resiliencia ante Fallos (Limpieza y Sobreescritura)
+- **Protección contra Procesos Fallidos o Interrumpidos:**
+  - Si un proceso previo fue cancelado, falló o se reinicia sobre el mismo archivo original:
+    1. Se ejecuta un barrido preventivo (`purgePreviousFileParts`) en la carpeta destino seleccionada, eliminando cualquier archivo huérfano con el patrón `${baseName}_part*.*` o `${baseName}*.part`.
+    2. Al escribir cada nuevo segmento en el sistema de archivos local (`FileSystemWritableFileStream`), se fuerza el truncado inicial (`truncate(0)`) para asegurar que no queden residuos de ejecuciones incompletas.
+    3. Se limpia de forma reactiva el estado de segmentos previos en la interfaz antes de arrancar.
+- **Modo Preferente:** `window.showDirectoryPicker()`. El usuario selecciona una carpeta de destino una sola vez. Cada segmento se escribe directamente en disco liberando memoria.
+- **Modo Fallback:** Si la API del sistema de archivos no está soportada, se utiliza un empaquetador ZIP en streaming (`client-zip`) para descarga directa.
 
 ### 3. Resource Optimization Heuristics
 

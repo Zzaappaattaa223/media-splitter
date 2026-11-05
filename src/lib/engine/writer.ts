@@ -25,7 +25,47 @@ export async function pickOutputDirectory(): Promise<FileSystemDirectoryHandle |
 }
 
 /**
- * Writes a segment directly to a local directory stream-by-stream
+ * Purges any previous or failed segments associated with the target media file
+ * from the selected directory before starting a fresh run.
+ */
+export async function purgePreviousFileParts(
+  dirHandle: FileSystemDirectoryHandle,
+  sourceFilename: string
+): Promise<number> {
+  const baseName = sourceFilename.substring(0, sourceFilename.lastIndexOf('.')) || sourceFilename;
+  const partPrefix = `${baseName}_part`;
+  let purgedCount = 0;
+
+  try {
+    // FileSystemDirectoryHandle supports async iteration via entries() or values()
+    const handleAny = dirHandle as unknown as {
+      entries?: () => AsyncIterable<[string, FileSystemHandle]>;
+      values?: () => AsyncIterable<FileSystemHandle>;
+      removeEntry: (name: string, options?: { recursive?: boolean }) => Promise<void>;
+    };
+
+    if (handleAny.entries) {
+      for await (const [entryName] of handleAny.entries()) {
+        if (entryName.startsWith(partPrefix) || (entryName.startsWith(baseName) && entryName.endsWith('.part'))) {
+          try {
+            await handleAny.removeEntry(entryName);
+            purgedCount++;
+          } catch (err) {
+            console.warn(`Could not remove orphan file ${entryName}`, err);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Error during purgePreviousFileParts:', err);
+  }
+
+  return purgedCount;
+}
+
+/**
+ * Writes a segment directly to a local directory stream-by-stream,
+ * truncating any existing content to prevent corruption.
  */
 export async function writeSegmentToDirectory(
   dirHandle: FileSystemDirectoryHandle,
@@ -33,7 +73,8 @@ export async function writeSegmentToDirectory(
   blob: Blob
 ): Promise<void> {
   const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
-  const writable = await fileHandle.createWritable();
+  const writable = await fileHandle.createWritable({ keepExistingData: false });
+  await writable.truncate(0);
   await writable.write(blob);
   await writable.close();
 }
