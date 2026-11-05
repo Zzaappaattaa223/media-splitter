@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/dropzone.tsx","./src/components/progressdashboard.tsx","./src/components/segmentlist.tsx","./src/components/splitcontrols.tsx","./src/lib/types.ts","./src/lib/engine/inspector.ts","./src/lib/engine/planner.ts","./src/lib/engine/slicer.ts","./src/lib/engine/writer.ts"],"version":"5.7.3"}
